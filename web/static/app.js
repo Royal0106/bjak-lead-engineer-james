@@ -9,12 +9,53 @@ const uploadStatus = document.getElementById("upload-status");
 const suggestions = document.getElementById("suggestions");
 const newChatBtn = document.getElementById("new-chat");
 
+const RESUME_TEXT_KEY = "resume_ai_text";
+const RESUME_NAME_KEY = "resume_ai_filename";
+
 function esc(text) {
   return String(text)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function saveResumeSession(filename, text) {
+  try {
+    sessionStorage.setItem(RESUME_TEXT_KEY, text || "");
+    sessionStorage.setItem(RESUME_NAME_KEY, filename || "");
+  } catch (_) {
+    /* ignore quota errors */
+  }
+}
+
+function loadResumeSession() {
+  try {
+    return {
+      text: sessionStorage.getItem(RESUME_TEXT_KEY) || "",
+      filename: sessionStorage.getItem(RESUME_NAME_KEY) || "",
+    };
+  } catch (_) {
+    return { text: "", filename: "" };
+  }
+}
+
+function clearResumeSession() {
+  try {
+    sessionStorage.removeItem(RESUME_TEXT_KEY);
+    sessionStorage.removeItem(RESUME_NAME_KEY);
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function detailMessage(data) {
+  if (!data) return "Request failed";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) {
+    return data.detail.map((d) => d.msg || JSON.stringify(d)).join("; ");
+  }
+  return data.message || "Request failed";
 }
 
 function showEmpty() {
@@ -27,15 +68,23 @@ showEmpty();
 async function refreshResumeStatus() {
   try {
     const data = await fetch("/api/resume").then((r) => r.json());
+    const session = loadResumeSession();
     if (data.uploaded) {
       resumeLabel.textContent = data.filename || "Resume ready";
       resumeMeta.textContent = `Studied · ${data.chars.toLocaleString()} characters`;
+    } else if (session.text) {
+      resumeLabel.textContent = session.filename || "Resume ready";
+      resumeMeta.textContent = `Studied · ${session.text.length.toLocaleString()} characters`;
     } else {
       resumeLabel.textContent = "No resume uploaded yet";
       resumeMeta.textContent = "PDF, DOCX, TXT, or MD · max 8MB";
     }
   } catch (_) {
-    /* ignore */
+    const session = loadResumeSession();
+    if (session.text) {
+      resumeLabel.textContent = session.filename || "Resume ready";
+      resumeMeta.textContent = `Studied · ${session.text.length.toLocaleString()} characters`;
+    }
   }
 }
 
@@ -62,8 +111,14 @@ fileInput.addEventListener("change", async () => {
   body.append("file", file);
   try {
     const res = await fetch("/api/upload", { method: "POST", body });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Upload failed");
+    let data = {};
+    try {
+      data = await res.json();
+    } catch (_) {
+      throw new Error(res.status === 500 ? "Upload failed on server (500)." : "Upload failed");
+    }
+    if (!res.ok) throw new Error(detailMessage(data));
+    saveResumeSession(data.filename, data.text || "");
     uploadStatus.textContent = data.message || "Resume ready.";
     await refreshResumeStatus();
     appendAssistant({
@@ -136,16 +191,26 @@ form.addEventListener("submit", async (event) => {
   send.textContent = "…";
   showTyping();
   try {
+    const session = loadResumeSession();
     const res = await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({
+        question,
+        resume_text: session.text || null,
+        resume_filename: session.filename || null,
+      }),
     });
-    const data = await res.json();
+    let data = {};
+    try {
+      data = await res.json();
+    } catch (_) {
+      data = { detail: "Server error" };
+    }
     hideTyping();
     if (!res.ok) {
       appendAssistant({
-        answer: typeof data.detail === "string" ? data.detail : "Ask me something about my background.",
+        answer: detailMessage(data),
         can_answer: false,
         kind: "off_topic",
         sources: [],
@@ -156,7 +221,7 @@ form.addEventListener("submit", async (event) => {
   } catch (_) {
     hideTyping();
     appendAssistant({
-      answer: "Ask me something about my background.",
+      answer: "Could not reach the server. Please try again.",
       can_answer: false,
       kind: "off_topic",
       sources: [],

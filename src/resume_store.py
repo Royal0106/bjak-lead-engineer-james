@@ -1,17 +1,25 @@
-"""Resume upload, text extraction, and indexing hooks."""
+"""Resume upload, text extraction, and indexing hooks.
+
+Works locally and on serverless (Vercel): writes go to a writable data dir (/tmp),
+with an in-memory fallback when the filesystem is read-only or ephemeral.
+"""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from src.config import ROOT, get_settings
-from src.ingest import ingest
+from src.config import get_settings
+from src.ingest import build_index_payload, write_index_payload
 
-UPLOAD_DIR = ROOT / "knowledge" / "uploads"
-ACTIVE_RESUME = UPLOAD_DIR / "active_resume.md"
 ALLOWED_SUFFIXES = {".pdf", ".txt", ".md", ".docx"}
+
+# Process memory — required on Vercel because /tmp is per-instance and ephemeral
+_MEMORY_RESUME: str = ""
+_MEMORY_FILENAME: str = ""
+_MEMORY_INDEX: dict[str, Any] | None = None
 
 
 @dataclass
@@ -19,20 +27,59 @@ class UploadResult:
     filename: str
     chars: int
     path: str
+    text: str
+
+
+def upload_dir() -> Path:
+    return get_settings(require_api_key=False).upload_dir
+
+
+def active_resume_path() -> Path:
+    return upload_dir() / "active_resume.md"
 
 
 def ensure_dirs() -> None:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        upload_dir().mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+def get_memory_index() -> dict[str, Any] | None:
+    return _MEMORY_INDEX
+
+
+def set_memory_index(payload: dict[str, Any] | None) -> None:
+    global _MEMORY_INDEX
+    _MEMORY_INDEX = payload
 
 
 def has_active_resume() -> bool:
-    return ACTIVE_RESUME.exists() and ACTIVE_RESUME.stat().st_size > 40
+    if len(_MEMORY_RESUME.strip()) > 40:
+        return True
+    path = active_resume_path()
+    try:
+        return path.exists() and path.stat().st_size > 40
+    except OSError:
+        return False
 
 
 def active_resume_text() -> str:
-    if not has_active_resume():
-        return ""
-    return ACTIVE_RESUME.read_text(encoding="utf-8")
+    if _MEMORY_RESUME.strip():
+        return _MEMORY_RESUME
+    path = active_resume_path()
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    return ""
+
+
+def _set_memory_resume(body: str, filename: str) -> None:
+    global _MEMORY_RESUME, _MEMORY_FILENAME
+    _MEMORY_RESUME = body
+    _MEMORY_FILENAME = filename
 
 
 def _clean_text(text: str) -> str:
@@ -56,8 +103,9 @@ def extract_text(filename: str, data: bytes) -> str:
         return _clean_text(data.decode("utf-8", errors="ignore"))
 
     if suffix == ".pdf":
-        from pypdf import PdfReader
         from io import BytesIO
+
+        from pypdf import PdfReader
 
         reader = PdfReader(BytesIO(data))
         pages = []
@@ -70,6 +118,7 @@ def extract_text(filename: str, data: bytes) -> str:
 
     if suffix == ".docx":
         from io import BytesIO
+
         from docx import Document
 
         doc = Document(BytesIO(data))
@@ -81,14 +130,9 @@ def extract_text(filename: str, data: bytes) -> str:
     raise ValueError("Unsupported file type")
 
 
-def save_and_index(filename: str, data: bytes) -> UploadResult:
-    ensure_dirs()
-    if len(data) > 8 * 1024 * 1024:
-        raise ValueError("File too large (max 8MB)")
-
-    text = extract_text(filename, data)
+def _format_resume_md(filename: str, text: str) -> str:
     safe_name = Path(filename).name.replace("`", "'")
-    body = (
+    return (
         "---\n"
         "id: uploaded_resume\n"
         "source_type: cv\n"
@@ -97,16 +141,80 @@ def save_and_index(filename: str, data: bytes) -> UploadResult:
         "---\n\n"
         f"{text.strip()}\n"
     )
-    ACTIVE_RESUME.write_text(body, encoding="utf-8")
 
-    # Prefer uploaded resume: index uploads + keep seed sources for gaps/demo
+
+def _plain_body(raw: str) -> str:
+    return re.sub(r"^---.*?---\s*", "", raw, count=1, flags=re.S).strip()
+
+
+def hydrate_resume(text: str, filename: str = "session_resume.txt") -> None:
+    """Restore resume from client session (needed across serverless instances)."""
+    cleaned = _clean_text(text or "")
+    if len(cleaned) < 40:
+        raise ValueError("Resume text is empty or too short")
+    body = _format_resume_md(filename, cleaned)
+    _set_memory_resume(body, Path(filename).name)
+    try:
+        ensure_dirs()
+        active_resume_path().write_text(body, encoding="utf-8")
+    except OSError:
+        pass
+    _reindex_best_effort()
+
+
+def _reindex_best_effort() -> None:
     settings = get_settings(require_api_key=False)
-    ingest(extra_dirs=[UPLOAD_DIR], sources_dir=settings.sources_dir)
+    try:
+        payload = build_index_payload(
+            sources_dir=settings.sources_dir,
+            extra_dirs=[settings.upload_dir],
+            extra_documents=[
+                {
+                    "id": "uploaded_resume",
+                    "source_type": "cv",
+                    "synthetic": False,
+                    "path": "memory://uploaded_resume",
+                    "text": active_resume_text(),
+                }
+            ],
+        )
+        set_memory_index(payload)
+        try:
+            write_index_payload(payload, settings.index_path)
+        except OSError:
+            pass
+    except Exception:
+        # Answering still works from resume body without TF-IDF index
+        set_memory_index(None)
+
+
+def save_and_index(filename: str, data: bytes) -> UploadResult:
+    max_bytes = 4 * 1024 * 1024 if __import__("os").getenv("VERCEL") else 8 * 1024 * 1024
+    if len(data) > max_bytes:
+        raise ValueError(f"File too large (max {max_bytes // (1024 * 1024)}MB)")
+
+    text = extract_text(filename, data)
+    safe_name = Path(filename).name.replace("`", "'")
+    body = _format_resume_md(safe_name, text)
+    _set_memory_resume(body, safe_name)
+
+    path_str = "memory://uploaded_resume"
+    try:
+        ensure_dirs()
+        path = active_resume_path()
+        path.write_text(body, encoding="utf-8")
+        path_str = str(path.as_posix())
+    except OSError:
+        # Read-only filesystem (e.g. Vercel) — memory is enough
+        pass
+
+    _reindex_best_effort()
 
     return UploadResult(
         filename=safe_name,
         chars=len(text),
-        path=str(ACTIVE_RESUME.as_posix()),
+        path=path_str,
+        text=text,
     )
 
 
@@ -115,7 +223,10 @@ def resume_status() -> dict:
         return {"uploaded": False, "filename": None, "chars": 0}
     raw = active_resume_text()
     match = re.search(r"original_filename:\s*(.+)", raw)
-    name = match.group(1).strip() if match else "active_resume.md"
-    # Approximate body size without front matter
-    body = re.sub(r"^---.*?---\s*", "", raw, count=1, flags=re.S)
+    name = (
+        match.group(1).strip()
+        if match
+        else (_MEMORY_FILENAME or "active_resume.md")
+    )
+    body = _plain_body(raw)
     return {"uploaded": True, "filename": name, "chars": len(body.strip())}

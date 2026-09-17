@@ -1,14 +1,14 @@
-"""TF-IDF retrieval over the local index."""
+"""TF-IDF retrieval over the local (or in-memory) index."""
 
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 from src.config import Settings, get_settings
 
@@ -28,16 +28,30 @@ class RetrievedChunk:
     synthetic: bool
 
 
+def _load_index_data(settings: Settings) -> dict[str, Any]:
+    # Prefer live in-memory index (serverless upload in this process)
+    try:
+        from src.resume_store import get_memory_index
+
+        mem = get_memory_index()
+        if mem and mem.get("chunks"):
+            return mem
+    except Exception:
+        pass
+
+    if settings.index_path.exists():
+        return json.loads(settings.index_path.read_text(encoding="utf-8"))
+
+    raise FileNotFoundError(
+        f"Index missing at {settings.index_path}. Upload a resume or run: python -m src.ingest"
+    )
+
+
 class Retriever:
     def __init__(self, settings: Settings | None = None):
-        self.settings = settings or get_settings()
-        if not self.settings.index_path.exists():
-            raise FileNotFoundError(
-                f"Index missing at {self.settings.index_path}. Run: python -m src.ingest"
-            )
-        data = json.loads(self.settings.index_path.read_text(encoding="utf-8"))
+        self.settings = settings or get_settings(require_api_key=False)
+        data = _load_index_data(self.settings)
         self.chunks = data["chunks"]
-        # Rebuild vectorizer from stored vocabulary/idf for identical query space
         self.vectorizer = TfidfVectorizer(
             lowercase=True,
             ngram_range=(1, 2),
@@ -45,10 +59,8 @@ class Retriever:
             stop_words="english",
             vocabulary=data["vocabulary"],
         )
-        # fit on chunk texts to attach idf; then overwrite idf from store
         self.vectorizer.fit([c["text"] for c in self.chunks])
         self.vectorizer.idf_ = np.array(data["idf"], dtype=np.float64)
-        # sklearn stores idf in _tfidf.idf_
         self.vectorizer._tfidf.idf_ = self.vectorizer.idf_
         self.matrix = np.array([c["embedding"] for c in self.chunks], dtype=np.float64)
 
@@ -81,7 +93,9 @@ class Retriever:
                 break
         return out
 
-    def retrieve(self, query: str, top_k: int | None = None, *, prefer_source: str | None = None) -> list[RetrievedChunk]:
+    def retrieve(
+        self, query: str, top_k: int | None = None, *, prefer_source: str | None = None
+    ) -> list[RetrievedChunk]:
         top_k = top_k or self.settings.retrieval_top_k
         q = self.vectorizer.transform([query]).toarray()
         from sklearn.metrics.pairwise import cosine_similarity
@@ -109,11 +123,12 @@ class Retriever:
         if prefer_source:
             preferred = [c for c in scored if c.source_id == prefer_source]
             if preferred:
-                filtered = [c for c in preferred if c.score >= self.settings.retrieval_min_score]
+                filtered = [
+                    c for c in preferred if c.score >= self.settings.retrieval_min_score
+                ]
                 if not filtered:
                     filtered = preferred[:top_k]
                 return filtered[:top_k]
 
         filtered = [c for c in scored if c.score >= self.settings.retrieval_min_score]
         return filtered[:top_k]
-
