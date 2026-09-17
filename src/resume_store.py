@@ -147,7 +147,9 @@ def _plain_body(raw: str) -> str:
     return re.sub(r"^---.*?---\s*", "", raw, count=1, flags=re.S).strip()
 
 
-def hydrate_resume(text: str, filename: str = "session_resume.txt") -> None:
+def hydrate_resume(
+    text: str, filename: str = "session_resume.txt", *, reindex: bool = False
+) -> None:
     """Restore resume from client session (needed across serverless instances)."""
     cleaned = _clean_text(text or "")
     if len(cleaned) < 40:
@@ -159,7 +161,9 @@ def hydrate_resume(text: str, filename: str = "session_resume.txt") -> None:
         active_resume_path().write_text(body, encoding="utf-8")
     except OSError:
         pass
-    _reindex_best_effort()
+    # Skip heavy TF-IDF rebuild on every ask — that caused timeouts/500s on Vercel
+    if reindex:
+        _reindex_best_effort()
 
 
 def _reindex_best_effort() -> None:

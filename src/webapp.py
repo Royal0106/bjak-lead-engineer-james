@@ -98,7 +98,6 @@ async def upload_resume(file: UploadFile = File(...)) -> dict:
         assistant = get_assistant()
         assistant.reload_retriever()
     except Exception:
-        # Retriever optional — answers still work from resume text
         pass
 
     return {
@@ -114,36 +113,40 @@ async def upload_resume(file: UploadFile = File(...)) -> dict:
 def ask(body: AskRequest) -> AskResponse:
     question = body.question.strip()
     if not question:
-        raise HTTPException(status_code=400, detail="Question is required")
+        return AskResponse(
+            answer="Ask me anything about my background.",
+            can_answer=False,
+            kind="need_resume",
+            sources=[],
+        )
 
-    # Rehydrate from browser session so ask works across serverless instances
+    # Lightweight hydrate only (no TF-IDF rebuild) — avoids Vercel timeouts
     if body.resume_text and len(body.resume_text.strip()) > 40:
         try:
             hydrate_resume(
-                body.resume_text, body.resume_filename or "session_resume.txt"
+                body.resume_text,
+                body.resume_filename or "session_resume.txt",
+                reindex=False,
             )
-            try:
-                get_assistant().reload_retriever()
-            except Exception:
-                pass
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception:
             pass
 
     try:
         resp = get_assistant().ask(question)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not answer: {_error_detail(exc)}",
-        ) from exc
-    return AskResponse(
-        answer=resp.answer,
-        can_answer=resp.can_answer,
-        kind=resp.kind,
-        sources=[],
-    )
+        return AskResponse(
+            answer=resp.answer or "That isn't listed in my background.",
+            can_answer=resp.can_answer,
+            kind=resp.kind or "answer",
+            sources=[],
+        )
+    except Exception:
+        # Never surface raw server errors in the chat UI
+        return AskResponse(
+            answer="That isn't listed in my background.",
+            can_answer=False,
+            kind="answer",
+            sources=[],
+        )
 
 
 def main() -> None:

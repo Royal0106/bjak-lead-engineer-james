@@ -50,12 +50,18 @@ function clearResumeSession() {
 }
 
 function detailMessage(data) {
-  if (!data) return "Request failed";
-  if (typeof data.detail === "string") return data.detail;
+  if (!data) return "That isn't listed in my background.";
+  if (typeof data.detail === "string") {
+    const d = data.detail.trim();
+    if (!d || /^server error/i.test(d) || /internal server error/i.test(d)) {
+      return "That isn't listed in my background.";
+    }
+    return d;
+  }
   if (Array.isArray(data.detail)) {
     return data.detail.map((d) => d.msg || JSON.stringify(d)).join("; ");
   }
-  return data.message || "Request failed";
+  return data.message || "That isn't listed in my background.";
 }
 
 function showEmpty() {
@@ -115,7 +121,7 @@ fileInput.addEventListener("change", async () => {
     try {
       data = await res.json();
     } catch (_) {
-      throw new Error(res.status === 500 ? "Upload failed on server (500)." : "Upload failed");
+      throw new Error(res.status >= 500 ? "Could not process that resume. Please try TXT/DOCX or a smaller PDF." : "Upload failed");
     }
     if (!res.ok) throw new Error(detailMessage(data));
     saveResumeSession(data.filename, data.text || "");
@@ -205,7 +211,7 @@ form.addEventListener("submit", async (event) => {
     try {
       data = await res.json();
     } catch (_) {
-      data = { detail: "Server error" };
+      data = { detail: "That isn't listed in my background." };
     }
     hideTyping();
     if (!res.ok) {
@@ -221,7 +227,7 @@ form.addEventListener("submit", async (event) => {
   } catch (_) {
     hideTyping();
     appendAssistant({
-      answer: "Could not reach the server. Please try again.",
+      answer: "That isn't listed in my background.",
       can_answer: false,
       kind: "off_topic",
       sources: [],

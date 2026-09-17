@@ -42,7 +42,8 @@ class GeminiClient:
                 ordered.append(m)
 
         for model in ordered:
-            for attempt in range(3):
+            attempts = 1 if __import__("os").getenv("VERCEL") else 3
+            for attempt in range(attempts):
                 try:
                     response = self.client.models.generate_content(
                         model=model,
@@ -70,12 +71,11 @@ class GeminiClient:
                             "FAILED_PRECONDITION",
                             "INVALID_ARGUMENT",
                             "PERMISSION_DENIED",
+                            "RESOURCE_EXHAUSTED",
+                            "429",
                         )
                     ):
                         break
-                    # Rate limit — brief wait then try next model / retry
-                    if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-                        time.sleep(2.0 * (attempt + 1))
-                        break
-                    time.sleep(1.0 * (attempt + 1))
+                    if not __import__("os").getenv("VERCEL"):
+                        time.sleep(1.0 * (attempt + 1))
         raise RuntimeError(f"Generation failed after retries: {last_err}") from last_err
