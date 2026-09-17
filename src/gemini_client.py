@@ -28,12 +28,13 @@ class GeminiClient:
         started = time.perf_counter()
         models_to_try = [
             self.settings.gemini_model,
-            "gemini-2.5-flash",
             "gemini-2.0-flash",
+            "gemini-2.5-flash",
             "gemini-flash-latest",
-            "gemini-2.5-pro",
-            "gemini-pro-latest",
+            "gemini-1.5-flash",
         ]
+        if not __import__("os").getenv("VERCEL"):
+            models_to_try.extend(["gemini-2.5-pro", "gemini-pro-latest"])
         seen: set[str] = set()
         ordered: list[str] = []
         for m in models_to_try:
@@ -41,8 +42,12 @@ class GeminiClient:
                 seen.add(m)
                 ordered.append(m)
 
+        # On Vercel prefer the configured flash model first, then one backup — fail fast
+        if __import__("os").getenv("VERCEL"):
+            ordered = ordered[:2]
+
         for model in ordered:
-            attempts = 1 if __import__("os").getenv("VERCEL") else 3
+            attempts = 1 if __import__("os").getenv("VERCEL") else 2
             for attempt in range(attempts):
                 try:
                     response = self.client.models.generate_content(
@@ -51,7 +56,7 @@ class GeminiClient:
                         config=types.GenerateContentConfig(
                             system_instruction=system,
                             temperature=temperature,
-                            max_output_tokens=self.settings.max_output_tokens,
+                            max_output_tokens=min(768, self.settings.max_output_tokens),
                         ),
                     )
                     text = (response.text or "").strip()
@@ -77,5 +82,5 @@ class GeminiClient:
                     ):
                         break
                     if not __import__("os").getenv("VERCEL"):
-                        time.sleep(1.0 * (attempt + 1))
+                        time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"Generation failed after retries: {last_err}") from last_err
